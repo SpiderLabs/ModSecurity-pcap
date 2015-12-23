@@ -5,6 +5,7 @@
 #include <iostream>
 #include <fstream>
 #include <string>
+
 // Structs for processing
 #include <netinet/ether.h>
 #include <netinet/tcp.h>
@@ -15,11 +16,68 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#include "pcre.h"
+
+
 
 #ifndef ETHERTYPE_IP6
-#define ETHERTYPE_IP6 0x86dd
+    #define ETHERTYPE_IP6 0x86dd
 #endif
+
+class ModSecurityAnalyzer
+{
+    public:
+        ModSecurityAnalyzer(std::string main_rule_uri);
+        int AddConnectionInfo(std::string src,int srcprt,std::string dst,int dstprt);
+        int AddRequestInfo(std::string uri,std::string method,std::string version);
+        int RunPhases();
+    private:
+        // ModSecurity engine 
+        ModSecurity::ModSecurity *_modsec;
+      
+       // modsecurity rules
+       ModSecurity::Rules *_rules;
+ 
+       // modsecurity transaction object
+       ModSecurity::Assay *_pmodsecAssay;
+};
+
+ModSecurityAnalyzer::ModSecurityAnalyzer(std::string main_rule_uri){
+    const char *error = NULL;
+    // Connect to libmodsecurity
+    _modsec = ModSecurity::msc_init();
+    ModSecurity::msc_set_connector_info(_modsec, "ModSecurity-pcap v0.0.1-alpha");
+    // Load the modsecurity rules specified.
+    _rules = ModSecurity::msc_create_rules_set();
+    if(msc_rules_add_file(_rules, main_rule_uri.c_str(), &error) < 0){
+        std::cerr << "Error: Issues loading the rules." << std::endl << error << std::endl;
+    }
+    ModSecurity::msc_rules_dump(_rules);
+}
+
+int ModSecurityAnalyzer::AddConnectionInfo(std::string src,int srcprt,std::string dst,int dstprt){
+    _pmodsecAssay = ModSecurity::msc_new_assay(_modsec, _rules, NULL);
+    ModSecurity::msc_process_connection(_pmodsecAssay, src.c_str(), srcprt, dst.c_str(), dstprt);
+    return 1;       
+
+}
+
+int ModSecurityAnalyzer::AddRequestInfo(std::string uri,std::string method,std::string version){
+    // ModSecurity wants the HTTP/ removed from the 1.1
+    version = version.substr(5,version.length()-5);
+    ModSecurity::msc_process_uri(_pmodsecAssay,uri.c_str(),method.c_str(),version.c_str());
+    return 1;
+}
+
+int ModSecurityAnalyzer::RunPhases(){
+    ModSecurity::msc_process_request_headers(_pmodsecAssay);
+    ModSecurity::msc_process_request_body(_pmodsecAssay);
+    ModSecurity::msc_process_response_headers(_pmodsecAssay);
+    ModSecurity::msc_process_response_body(_pmodsecAssay);
+    ModSecurity::msc_process_logging(_pmodsecAssay, 200);
+    return 1;
+}
+
+ 
 
 class Packet
 {
@@ -27,11 +85,16 @@ class Packet
         Packet(pcap_pkthdr *header, const u_char *data, int verbose);
         int parsePacket();
         int setTCPIPdata();
-        int extractHTTP();
-        const char* src;
-        const char* dst;
+        int extractHTTP(std::string type);
+        std::string src;
+        std::string dst;
         int srcprt;
         int dstprt;
+        int hasData;
+        std::string method;
+        std::string uri;
+        std::string version;
+        bool httpDetected = false;
         
     private:
         int _verbose;
@@ -41,15 +104,7 @@ class Packet
         struct ip *_ip;
         struct ip6_hdr *_ip6;
         struct tcphdr *_tcp;
-        int _dataLength;
-        // ModSecurity engine class
-        //static ModSecurity::ModSecurity _modsec;
-      
-       // modsecurity rules
-       //static ModSecurity::Rules _rules;
- 
-       // modsecurity transaction object
-       //ModSecurity::Assay *_pmodsecAssay;
+        std::string _appData;
 };
 
 // Our constructor that collects the packet header and data
@@ -60,7 +115,8 @@ Packet::Packet(pcap_pkthdr *header, const u_char *data, int verbose)
     _verbose = verbose;
 }
 
-// Returns 1 if there is an error
+// Returns -1 if there is an error
+// Returns 1 if success
 int Packet::parsePacket()   
 {
     // Assume Ethr and save the header
@@ -90,8 +146,9 @@ int Packet::parsePacket()
         if(_verbose){
             std::cout << "[+] Parsed out IPv6 header" << std::endl;
         }
-    }else{
         return 1;
+    }else{
+        return -1;
     }
 
     // If we have TCP extract the header
@@ -101,13 +158,22 @@ int Packet::parsePacket()
             std::cout << "[+] Parsed out TCP header" << std::endl;
         }
         // Overwrite the data we have with the remaining data
-        _data = (u_char*)(_data + sizeof(struct ether_header) + sizeof(struct ip) + sizeof(struct tcphdr));
-        _dataLength = _header->len - (sizeof(struct ether_header) + sizeof(struct ip) + sizeof(struct tcphdr));
-        if(_verbose){
-            std::cout << "[+] Remaining data is " << _dataLength << " bytes long" << std::endl;
+        _appData = (char*)(_data + sizeof(struct ether_header) + sizeof(struct ip) + sizeof(struct tcphdr));
+        // Check if we have any data
+        if(_appData.length() != 0){
+            //std::cout << "TEST" << std::endl;
+            hasData = 1;
+            if(_verbose){
+                std::cout << "[+] Remaining data is " << _appData.length() << " bytes long" << std::endl;
+            }
+        }else{
+            hasData = 0;
+            if(_verbose){
+                std::cout << "[+] This packet has no data" << std::endl;
+            }
         }
     }else{
-        return 1;
+        return -1;
     }
 }
 
@@ -121,7 +187,7 @@ int Packet::setTCPIPdata()
         const char* ret1 = inet_ntop(AF_INET, &_ip->ip_src, sourceIP, sizeof(sourceIP));
         const char* ret2 =inet_ntop(AF_INET, &_ip->ip_dst, destIP, sizeof(destIP));
         if(ret1 == NULL || ret2 == NULL){
-            return 1;
+            return -1;
         }
         src = sourceIP;
         dst = destIP;
@@ -133,7 +199,7 @@ int Packet::setTCPIPdata()
         const char* ret1 = inet_ntop(AF_INET6, &_ip->ip_src, sourceIP, sizeof(sourceIP));
         const char* ret2 = inet_ntop(AF_INET6, &_ip->ip_dst, destIP, sizeof(destIP));
         if(ret1 == NULL || ret2 == NULL){
-            return 1;
+            return -1;
         }
         src = sourceIP;
         dst = destIP;
@@ -146,23 +212,87 @@ int Packet::setTCPIPdata()
     }
 }
 
-int Packet::extractHTTP()   
+int Packet::extractHTTP(std::string type)   
 {
-  return 0;
+    std::vector<std::string> seglist;
+    int start = 0;
+    // Add each line of a potentail request to a vector (split on \r\n)
+    for(int i=0; i<_appData.length();i++){
+        // We do some limited bounds checking and look for /r/n
+        if(_appData.at(i) == '\r' && i != _appData.length()-1){
+            if(_appData.at(i+1) == '\n'){
+                // Add each line in the HTTP header to a vector
+                seglist.push_back(_appData.substr(start,i-start));
+                start = i+2;
+            }
+        }
+    }
+    if( start != _appData.length()-start){
+        seglist.push_back(_appData.substr(start,_appData.length()-start));
+    }
+    std::string firstLine = seglist.front();
+    if(type == "Request"){
+        
+        int firstSpace = -1;
+        int secondSpace = -1;
+        // C++ regex takes a long time (way too long)
+        // ([A-Z].*?)\\s(.*?)\\s(HTTP/\\d\\.\\d)
+        for(int i = 0; i<firstLine.length();i++){
+            // Make sure we don't have a third space
+            if(isspace(firstLine.at(i)) && secondSpace!=-1){
+                httpDetected = false;
+                return -1;
+            }
+            if(isspace(firstLine.at(i))){
+                if(firstSpace==-1){
+                    firstSpace=i;
+                }else{
+                    secondSpace=i;
+                }
+            }
+        }
+        // Make sure we found two spaces and no more or bail
+        if(firstSpace == -1 || secondSpace == -1){
+            httpDetected = false;
+            return -1;        
+        }
 
+        method = firstLine.substr(0,firstSpace);
+        uri = firstLine.substr(firstSpace+1,secondSpace-firstSpace+1);   
+        version = firstLine.substr(secondSpace+1,firstLine.length()-secondSpace+1);
+
+
+        // Check to make sure these conform to spec
+        // version should say HTTP/[something]
+        if(version.substr(0,5) != "HTTP/"){
+            httpDetected = false;
+            return -1;
+        }
+        // method should be in caps
+        for(int i = 0; i<method.length();i++){
+            // CAPITAL LETTERS = 65-90
+            if((int)method.at(i) < 65 || (int)method.at(i) > 90){
+                httpDetected = false;
+                return -1;
+            }
+        }
+        httpDetected = true;
+        return 1;
+    }
 }
 
              
-
+// Returns -1 on error
+// Returns 1 on success
 int checkArgs(int argc, char** argv, int* verboseRef, std::string* filenameRef)
 {
     std::stringstream usage;
     usage << "Usage: " << argv[0] << " [OPTIONS]... [FILE]";
-
+    
     // Check the number of parameters
     if (argc < 2) {
         std::cerr << usage.str() << std::endl;
-        return 1;
+        return -1;
     }else{
         *verboseRef = 0;
         if(argc > 2){
@@ -173,12 +303,12 @@ int checkArgs(int argc, char** argv, int* verboseRef, std::string* filenameRef)
                 // Does everything start with a '-'
                 if(argv[i][0] != '-'){
                     std::cerr << usage.str() << std::endl;
-                    return 1;
+                    return -1;
                 }
                 // ARe they all two chars long?
                 if(strnlen(argv[i],5) != 2){
                     std::cerr << usage.str() << std::endl;
-                    return 1;
+                    return -1;
                 }
                 // Set our verbose argument
                 if(argv[i][1] == 'v'){
@@ -188,7 +318,7 @@ int checkArgs(int argc, char** argv, int* verboseRef, std::string* filenameRef)
                 // If we get an unknown arg, exit
                 if(knownArg == 0){
                     std::cerr << usage.str() << std::endl;
-                    return 1;
+                    return -1;
                 }
             }
         }
@@ -201,10 +331,10 @@ int checkArgs(int argc, char** argv, int* verboseRef, std::string* filenameRef)
                     std::cout << "[+] We were able to succesfully open " << filename << std::endl;
                 }
                 *filenameRef = filename;
-                return 0;
+                return 1;
             }else{
                 std::cerr << "Error: Could not open/find the file you referenced. Exiting." << std::endl;
-                return 1;
+                return -1;
             }
         }
         std::cerr << "Error: Unexpected input was identified, exiting." << std::endl;
@@ -224,14 +354,18 @@ int main(int argc, char* argv[])
     std::string  filename;
 
     // Check if our arg values are wrong
-    if(checkArgs(argc,argv,&verbose,&filename) == 1){
-        return 1;    
+    if(checkArgs(argc,argv,&verbose,&filename) == -1){
+        return -1;    
     }
+
+    // Initalize the ModSecurity Engine 
+    ModSecurityAnalyzer *msa = new ModSecurityAnalyzer("basic_rules.conf");
+
     // Read in our pcap file
     pcap_t * pcap = pcap_open_offline(filename.c_str(),errbuff);
     if( pcap == NULL ){
         std::cerr << "Error: unable to open Pcap File supplied: " << errbuff << std::endl;
-        return 1;
+        return -1;
     }
     
     // Loop through each packet
@@ -239,17 +373,33 @@ int main(int argc, char* argv[])
     {  
         Packet * mypacket = new Packet(header,data,verbose);
         // Try parsing each packet
-        if(!mypacket->parsePacket()){
+        if(mypacket->parsePacket() == -1){
             if(verbose){
                 std::cerr << "Error: There was a problem parsing a packet" << std::endl;
             }
+            continue;
+        }
+        // Check if we have a ports/IPs
+        if(mypacket->setTCPIPdata() != -1){
+            // Check if it is on a common HTTP port first
+            if((mypacket->srcprt == 80 || mypacket->srcprt == 8080) && mypacket->hasData == 1){
+                // Extract HTTP information
+                mypacket->extractHTTP("Response");
+            }
+            if((mypacket->dstprt == 80 || mypacket->dstprt== 8080) && mypacket->hasData == 1 ){
+                mypacket->extractHTTP("Request");
+            }     
         }else{
-            if(!mypacket->setTCPIPdata()){  
-                if(verbose){
-                    std::cerr << "Error: There was problem extracting TCPIP data" << std::endl;
-                }
+            if(verbose){
+                std::cerr << "Error: There was problem extracting TCPIP data" << std::endl;
+                continue;
             }
         }
+        if(mypacket->httpDetected == true){
+            msa->AddConnectionInfo(mypacket->src, mypacket->srcprt,mypacket->dst,mypacket->dstprt);
+            msa->AddRequestInfo(mypacket->uri,mypacket->method,mypacket->version);
+            msa->RunPhases();
+        }
     }
+    
 }
-
