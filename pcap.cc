@@ -30,6 +30,7 @@ class ModSecurityAnalyzer
         int AddConnectionInfo(std::string src,int srcprt,std::string dst,int dstprt);
         int AddRequestInfo(std::string uri,std::string method,std::string version);
         int RunPhases();
+        int RunCleanup();
     private:
         // ModSecurity engine 
         ModSecurity::ModSecurity *_modsec;
@@ -75,6 +76,11 @@ int ModSecurityAnalyzer::RunPhases(){
     ModSecurity::msc_process_response_body(_pmodsecAssay);
     ModSecurity::msc_process_logging(_pmodsecAssay, 200);
     return 1;
+}
+
+int ModSecurityAnalyzer::RunCleanup(){
+    ModSecurity::msc_rules_cleanup(_rules);
+    ModSecurity::msc_cleanup(_modsec);
 }
 
  
@@ -401,5 +407,6 @@ int main(int argc, char* argv[])
             msa->RunPhases();
         }
     }
+    msa->RunCleanup();
     
 }
