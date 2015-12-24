@@ -1,5 +1,3 @@
-/////////////////////////// example /////////////////////
-///////////////////// header file ////////////////////////////////
 #include <modsecurity/modsecurity.h>
 #include <pcap.h>
 #include <iostream>
@@ -49,8 +47,6 @@ class Packet
         std::string rVersion;
         std::string status;   
         std::string phrase;
-
- std::vector<std::string> _splitHTTP;
         
     private:
         int _verbose;
@@ -62,6 +58,7 @@ class Packet
         struct tcphdr *_tcp;
         std::string _appData;
         int _hasHTTPData = 0;
+        std::vector<std::string> _splitHTTP;
 };
 
 // Our constructor that collects the packet header and data
@@ -72,6 +69,8 @@ Packet::Packet(pcap_pkthdr *header, const u_char *data, int verbose)
     _verbose = verbose;
 }
 
+// We will take a raw packet and break it down 
+// part by part till we get to the app data
 // Returns -1 if there is an error
 // Returns 1 if success
 int Packet::parsePacket()   
@@ -160,14 +159,19 @@ int Packet::setTCPIPdata()
         src = sourceIP;
         dst = destIP;
     }
+    // Extract our src and dest ports
     srcprt = ntohs(_tcp->source);
     dstprt = ntohs(_tcp->dest);
+
     if(_verbose){
         std::cout << "[+] Extracted source IP - " << src << " and source port " << srcprt << std::endl;
         std::cout << "[+] Extracted dest IP - " << dst << " and dest port " << dstprt << std::endl;
     }
 }
 
+// We need to check if it's an HTTP packet and
+// if it is extract the URI based on if it's
+// a request or a response HTTP
 int Packet::extractHTTPuri(std::string type)   
 {
     // Store our type for later
@@ -189,18 +193,29 @@ int Packet::extractHTTPuri(std::string type)
             }
         }
     }
+    // Make sure to not forget the last element (and bound checking)
     if( start != _appData.length()-start){
         seglist.push_back(_appData.substr(start,_appData.length()-start));
     }
+    // Persist our vector (representing line by line HTTP data)
     _splitHTTP = seglist;
+
+    // We'll only need the first line to get started
     std::string firstLine = seglist.front();
-    if(request){
-        
+
+    if(request){        
         int firstSpace = -1;
         int secondSpace = -1;
         // C++ regex takes a long time (way too long)
         // ([A-Z].*?)\\s(.*?)\\s(HTTP/\\d\\.\\d)
+        // get the locations of the first two spaces
         for(int i = 0; i<firstLine.length();i++){
+            // Make sure we don't have a third space (there shouldn't be)
+            if(isspace(firstLine.at(i)) && secondSpace!=-1){
+                httpDetected = false;
+                return -1;
+            }
+            // Otherwise record spaces
             if(isspace(firstLine.at(i))){
                 if(firstSpace==-1){
                     firstSpace=i;
@@ -209,7 +224,7 @@ int Packet::extractHTTPuri(std::string type)
                 }
             }
         }
-        // Make sure we found two spaces and no more or bail
+        // Make sure we found two spaces and no less or bail
         if(firstSpace == -1 || secondSpace == -1){
             httpDetected = false;
             return -1;        
@@ -237,17 +252,15 @@ int Packet::extractHTTPuri(std::string type)
         httpDetected = true;
         return 1;
     }
+    // If its not a request its an HTTP response 
     if(!request){
         int firstSpace = -1;
         int secondSpace = -1;
         // C++ regex takes a long time (way too long)
         // (HTTP/\\d\\.\\d)\\s(\\d{3})\\s(.*)
         for(int i = 0; i<firstLine.length();i++){
-            // Make sure we don't have a third space
-            if(isspace(firstLine.at(i)) && secondSpace!=-1){
-                httpDetected = false;
-                return -1;
-            }
+            // split the first two spaces out
+            // the phrase can have spaces 
             if(isspace(firstLine.at(i))){
                 if(firstSpace==-1){
                     firstSpace=i;
@@ -256,11 +269,12 @@ int Packet::extractHTTPuri(std::string type)
                 }
             }
         }
-        // Make sure we found two spaces and no more or bail
+        // Make sure we found two spaces and no less or bail
         if(firstSpace == -1 || secondSpace == -1){
             httpDetected = false;
             return -1;        
         }
+
         rVersion = firstLine.substr(0,firstSpace);
         status = firstLine.substr(firstSpace+1,secondSpace-firstSpace+1);   
         phrase = firstLine.substr(secondSpace+1,firstLine.length()-secondSpace+1);
@@ -276,7 +290,7 @@ int Packet::extractHTTPuri(std::string type)
             httpDetected = false;
             return -1;
         }
-        // Status should only be numeric
+        // Status should also only be numeric
         for(int i = 0; i<status.length();i++){
             // n3mb3rs - ASCII 48-57
             if((int)status.at(i) < 48 || (int)status.at(i) > 57){
@@ -288,18 +302,20 @@ int Packet::extractHTTPuri(std::string type)
     }
 }
 
-
+// We need to get the headers out one by one and
+// isolate the data portion of the HTTP element
 int Packet::extractHTTPData()   
 {
-    // We have a requestURI and something else (maybe headers)
+    // We have a request/response URI and something else (maybe headers)
     if(_splitHTTP.size() > 1){
         // First line is request/responseURI - last line may be data
         for(std::vector<std::string>::size_type header = 1; header != _splitHTTP.size()-1; header++) {
-            // Ignore blank lines
+            // Ignore blank lines (we'll use the later)
             if(_splitHTTP[header] == ""){
                 continue;
             }
-            // Search for colon
+
+            // Search for colon and split our header based on it
             for(int i = 0;i<_splitHTTP[header].length();i++){
                 if(_splitHTTP[header].at(i) == ':'){
                     headerNames.push_back(_splitHTTP[header].substr(0,i));
@@ -308,7 +324,9 @@ int Packet::extractHTTPData()
                 }
             }
         }
+
         // Check our headers to see if there is content
+        // apparently this isn't really a great check
         for(auto headerName: headerNames){
             if(headerName == "Content-Length"){
                 _hasHTTPData = 1;
@@ -329,7 +347,6 @@ int Packet::extractHTTPData()
                 }
             }
         }
-   
     }
 }
 
@@ -361,18 +378,21 @@ ModSecurityAnalyzer::ModSecurityAnalyzer(std::string main_rule_uri){
     const char *error = NULL;
     // Connect to libmodsecurity
     _modsec = modsecurity::msc_init();
-    modsecurity::msc_set_connector_info(_modsec, "ModSecurity-pcap v0.0.1-alpha");
+    _modsec->setConnectorInformation("ModSecurity-pcap v0.0.1-alpha");
+    
     // Load the modsecurity rules specified.
     _rules = modsecurity::msc_create_rules_set();
-    if(msc_rules_add_file(_rules, main_rule_uri.c_str(), &error) < 0){
+    if(modsecurity::msc_rules_add_file(_rules, main_rule_uri.c_str(), &error) < 0){
         std::cerr << "Error: Issues loading the rules." << std::endl << error << std::endl;
     }
-    modsecurity::msc_rules_dump(_rules);
+    // C++ form of msc_rules_dump()
+    _rules->dump();
 }
 
 
 int ModSecurityAnalyzer::AddConnectionInfo(std::string src,int srcprt,std::string dst,int dstprt){
     _pmodsecAssay = modsecurity::msc_new_assay(_modsec, _rules, NULL);
+    // Assign the IP's and ports to the transaction
     _pmodsecAssay->processConnection(src.c_str(), srcprt, dst.c_str(), dstprt);
     return 1;       
 
@@ -389,9 +409,12 @@ int ModSecurityAnalyzer::AddRequestInfo(Packet *mypacket){
     // ModSecurity wants the HTTP/ removed from the 1.1
     version = version.substr(5,version.length()-5);
     _pmodsecAssay->processURI(uri.c_str(),method.c_str(),version.c_str());
+
+    // Add each header key/value to as a header in modsec
     for(std::vector<std::string>::size_type header = 0; header != headerNames.size(); header++) {
       _pmodsecAssay->addRequestHeader(reinterpret_cast<const unsigned char*>(headerNames[header].c_str()),reinterpret_cast<const unsigned char*>(headerValues[header].c_str()));
     }
+
     // Add the body data only if it has a body
     if(bodyData != "" ){
         _pmodsecAssay->appendRequestBody(reinterpret_cast<const unsigned char*>(bodyData.c_str()),bodyData.length());
@@ -404,16 +427,22 @@ int ModSecurityAnalyzer::AddResponseInfo(Packet *mypacket){
     std::vector<std::string> headerNames = mypacket->headerNames;
     std::vector<std::string> headerValues =mypacket->headerValues;
 
-    // RESPONSE STATUS is not implmented yet
+    //TODO: RESPONSE STATUS is not implmented yet
+
+    // Add each response header as a header in modsec
     for(std::vector<std::string>::size_type header = 0; header != headerNames.size(); header++) {
       _pmodsecAssay->addResponseHeader(reinterpret_cast<const unsigned char*>(headerNames[header].c_str()),reinterpret_cast<const unsigned char*>(headerValues[header].c_str()));
     }
+    
+    // Add the body if there is one
     if(bodyData != "" ){
         _pmodsecAssay->appendRequestBody(reinterpret_cast<const unsigned char*>(bodyData.c_str()),bodyData.length());
     }
 
 }
 
+// Testing for interventions is needed but we can't deny anyway, we're out of line
+// If needed a TCP reset packet could be sent here to try and emulate inline-ness
 int ModSecurityAnalyzer::_testIntervention(modsecurity::ModSecurityIntervention status_it){
     _pmodsecAssay->intervention(&status_it);
     if( status_it.disruptive == 1)
@@ -429,6 +458,9 @@ int ModSecurityAnalyzer::_testIntervention(modsecurity::ModSecurityIntervention 
     }
     return 0;
 }
+
+// This is where we tell ModSec to actually check
+// our packet
 int ModSecurityAnalyzer::RunPhases(){
     modsecurity::ModSecurityIntervention status_it;
     _pmodsecAssay->processRequestHeaders();
@@ -444,12 +476,11 @@ int ModSecurityAnalyzer::RunPhases(){
     return 1;
 }
 int ModSecurityAnalyzer::RunAssayCleanup(){
-    //_pmodsecAssay->cleanup();
     delete _pmodsecAssay;
 }
 int ModSecurityAnalyzer::RunCleanup(){
-    modsecurity::msc_rules_cleanup(_rules);
-    modsecurity::msc_cleanup(_modsec);
+    delete _rules;
+    delete _modsec;
 }
 
  
@@ -568,20 +599,29 @@ int main(int argc, char* argv[])
                 continue;
             }
         }
+        // Only if we found HTTP data we need to do things
         if(mypacket->httpDetected == true){
-            mypacket->extractHTTPData();
+            // We want to add the IP/port info about the request
             msa->AddConnectionInfo(mypacket->src, mypacket->srcprt,mypacket->dst,mypacket->dstprt);
+            // This will pull out headers and body
+            mypacket->extractHTTPData();
+            // We then add them into modsec
             if(mypacket->request){
                 msa->AddRequestInfo(mypacket);
             }
             if(!mypacket->request){
                 msa->AddResponseInfo(mypacket);
             }
+            // Last we run our transaction through the rules
             msa->RunPhases();
         }
+        // We won't need our packet for this tool
+        delete mypacket;
         // TODO: cleaning up the assay results in a segfault?
         //msa->RunAssayCleanup();
     }
+    // Cleansup our modsec objects
     msa->RunCleanup();
+    delete msa;
     
 }
