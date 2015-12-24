@@ -32,8 +32,7 @@ class Packet
         int parsePacket();
         int setTCPIPdata();
         int extractHTTPuri(std::string type);
-        int extractHTTPRequest();
-        int extractHTTPResponse();
+        int extractHTTPData();
         int request;
         std::string src;
         std::string dst;
@@ -47,6 +46,9 @@ class Packet
         std::vector<std::string> headerNames;
         std::vector<std::string> headerValues;    
         std::string bodyData = "";
+        std::string rVersion;
+        std::string status;   
+        std::string phrase;
 
  std::vector<std::string> _splitHTTP;
         
@@ -199,11 +201,6 @@ int Packet::extractHTTPuri(std::string type)
         // C++ regex takes a long time (way too long)
         // ([A-Z].*?)\\s(.*?)\\s(HTTP/\\d\\.\\d)
         for(int i = 0; i<firstLine.length();i++){
-            // Make sure we don't have a third space
-            if(isspace(firstLine.at(i)) && secondSpace!=-1){
-                httpDetected = false;
-                return -1;
-            }
             if(isspace(firstLine.at(i))){
                 if(firstSpace==-1){
                     firstSpace=i;
@@ -240,17 +237,63 @@ int Packet::extractHTTPuri(std::string type)
         httpDetected = true;
         return 1;
     }
+    if(!request){
+        int firstSpace = -1;
+        int secondSpace = -1;
+        // C++ regex takes a long time (way too long)
+        // (HTTP/\\d\\.\\d)\\s(\\d{3})\\s(.*)
+        for(int i = 0; i<firstLine.length();i++){
+            // Make sure we don't have a third space
+            if(isspace(firstLine.at(i)) && secondSpace!=-1){
+                httpDetected = false;
+                return -1;
+            }
+            if(isspace(firstLine.at(i))){
+                if(firstSpace==-1){
+                    firstSpace=i;
+                }else{
+                    secondSpace=i;
+                }
+            }
+        }
+        // Make sure we found two spaces and no more or bail
+        if(firstSpace == -1 || secondSpace == -1){
+            httpDetected = false;
+            return -1;        
+        }
+        rVersion = firstLine.substr(0,firstSpace);
+        status = firstLine.substr(firstSpace+1,secondSpace-firstSpace+1);   
+        phrase = firstLine.substr(secondSpace+1,firstLine.length()-secondSpace+1);
+
+        // Check to make sure these conform to spec
+        // version should say HTTP/[something]
+        if(rVersion.substr(0,5) != "HTTP/"){
+            httpDetected = false;
+            return -1;
+        }
+        // Status should be of length 3 (eg 200)
+        if(status.length() != 3){
+            httpDetected = false;
+            return -1;
+        }
+        // Status should only be numeric
+        for(int i = 0; i<status.length();i++){
+            // n3mb3rs - ASCII 48-57
+            if((int)status.at(i) < 48 || (int)status.at(i) > 57){
+                httpDetected = false;
+                return -1;
+            }
+        }
+        
+    }
 }
 
 
-int Packet::extractHTTPRequest()   
+int Packet::extractHTTPData()   
 {
-    if(!request){
-        std::cout << "HELLO" << std::endl;
-    }
     // We have a requestURI and something else (maybe headers)
     if(_splitHTTP.size() > 1){
-        // First line is requestURI - last line may be data
+        // First line is request/responseURI - last line may be data
         for(std::vector<std::string>::size_type header = 1; header != _splitHTTP.size()-1; header++) {
             // Ignore blank lines
             if(_splitHTTP[header] == ""){
@@ -290,9 +333,6 @@ int Packet::extractHTTPRequest()
     }
 }
 
-int Packet::extractHTTPResponse()   
-{
-}  
          
 
 class ModSecurityAnalyzer
@@ -301,10 +341,12 @@ class ModSecurityAnalyzer
         ModSecurityAnalyzer(std::string main_rule_uri);
         int AddConnectionInfo(std::string src,int srcprt,std::string dst,int dstprt);
         int AddRequestInfo(Packet *mypacket);
-        int AddResponseInfo();
+        int AddResponseInfo(Packet *mypacket);
         int RunPhases();
+        int RunAssayCleanup();
         int RunCleanup();
     private:
+        int _testIntervention(modsecurity::ModSecurityIntervention status_it);
         // ModSecurity engine 
         modsecurity::ModSecurity *_modsec;
       
@@ -357,35 +399,54 @@ int ModSecurityAnalyzer::AddRequestInfo(Packet *mypacket){
     return 1;
 }
 
-int ModSecurityAnalyzer::AddResponseInfo(){
-    modsecurity::ModSecurityIntervention status_it;
-    //modsecurity::msc_append_response_body(_pmodsecAssay,(const unsigned char*)"",0);
-    
-    //analysis attack by modesecurity engine
-    _pmodsecAssay->processResponseBody();
+int ModSecurityAnalyzer::AddResponseInfo(Packet *mypacket){
+    std::string bodyData = mypacket->bodyData;
+    std::vector<std::string> headerNames = mypacket->headerNames;
+    std::vector<std::string> headerValues =mypacket->headerValues;
+
+    // RESPONSE STATUS is not implmented yet
+    for(std::vector<std::string>::size_type header = 0; header != headerNames.size(); header++) {
+      _pmodsecAssay->addResponseHeader(reinterpret_cast<const unsigned char*>(headerNames[header].c_str()),reinterpret_cast<const unsigned char*>(headerValues[header].c_str()));
+    }
+    if(bodyData != "" ){
+        _pmodsecAssay->appendRequestBody(reinterpret_cast<const unsigned char*>(bodyData.c_str()),bodyData.length());
+    }
+
+}
+
+int ModSecurityAnalyzer::_testIntervention(modsecurity::ModSecurityIntervention status_it){
     _pmodsecAssay->intervention(&status_it);
     if( status_it.disruptive == 1)
     {
+        std::cout << "There was a disruptive action but we are out of line" << std::endl;
         if(status_it.log != NULL){
              std::cerr << "processResponseBody intervention: " << status_it.log << std::endl;
         }else{
              std::cerr << "no data received from modsecuritylib in processResponseBody: status_it.log is NULL" << std::endl;
 
         }
-        return true;
+        return 1;
     }
+    return 0;
 }
-
-
 int ModSecurityAnalyzer::RunPhases(){
+    modsecurity::ModSecurityIntervention status_it;
     _pmodsecAssay->processRequestHeaders();
+    _testIntervention(status_it);
     _pmodsecAssay->processRequestBody();
+    _testIntervention(status_it);
     _pmodsecAssay->processResponseHeaders();
+    _testIntervention(status_it);
     _pmodsecAssay->processResponseBody();
+    _testIntervention(status_it);
     _pmodsecAssay->processLogging(200);
+    _testIntervention(status_it);
     return 1;
 }
-
+int ModSecurityAnalyzer::RunAssayCleanup(){
+    //_pmodsecAssay->cleanup();
+    delete _pmodsecAssay;
+}
 int ModSecurityAnalyzer::RunCleanup(){
     modsecurity::msc_rules_cleanup(_rules);
     modsecurity::msc_cleanup(_modsec);
@@ -508,15 +569,18 @@ int main(int argc, char* argv[])
             }
         }
         if(mypacket->httpDetected == true){
-            if(mypacket->request){
-                mypacket->extractHTTPRequest();
-            }
+            mypacket->extractHTTPData();
             msa->AddConnectionInfo(mypacket->src, mypacket->srcprt,mypacket->dst,mypacket->dstprt);
             if(mypacket->request){
                 msa->AddRequestInfo(mypacket);
             }
+            if(!mypacket->request){
+                msa->AddResponseInfo(mypacket);
+            }
             msa->RunPhases();
         }
+        // TODO: cleaning up the assay results in a segfault?
+        //msa->RunAssayCleanup();
     }
     msa->RunCleanup();
     
