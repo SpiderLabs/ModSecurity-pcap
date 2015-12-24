@@ -23,67 +23,7 @@
     #define ETHERTYPE_IP6 0x86dd
 #endif
 
-class ModSecurityAnalyzer
-{
-    public:
-        ModSecurityAnalyzer(std::string main_rule_uri);
-        int AddConnectionInfo(std::string src,int srcprt,std::string dst,int dstprt);
-        int AddRequestInfo(std::string uri,std::string method,std::string version);
-        int RunPhases();
-        int RunCleanup();
-    private:
-        // ModSecurity engine 
-        ModSecurity::ModSecurity *_modsec;
-      
-       // modsecurity rules
-       ModSecurity::Rules *_rules;
- 
-       // modsecurity transaction object
-       ModSecurity::Assay *_pmodsecAssay;
-};
 
-ModSecurityAnalyzer::ModSecurityAnalyzer(std::string main_rule_uri){
-    const char *error = NULL;
-    // Connect to libmodsecurity
-    _modsec = ModSecurity::msc_init();
-    ModSecurity::msc_set_connector_info(_modsec, "ModSecurity-pcap v0.0.1-alpha");
-    // Load the modsecurity rules specified.
-    _rules = ModSecurity::msc_create_rules_set();
-    if(msc_rules_add_file(_rules, main_rule_uri.c_str(), &error) < 0){
-        std::cerr << "Error: Issues loading the rules." << std::endl << error << std::endl;
-    }
-    ModSecurity::msc_rules_dump(_rules);
-}
-
-int ModSecurityAnalyzer::AddConnectionInfo(std::string src,int srcprt,std::string dst,int dstprt){
-    _pmodsecAssay = ModSecurity::msc_new_assay(_modsec, _rules, NULL);
-    ModSecurity::msc_process_connection(_pmodsecAssay, src.c_str(), srcprt, dst.c_str(), dstprt);
-    return 1;       
-
-}
-
-int ModSecurityAnalyzer::AddRequestInfo(std::string uri,std::string method,std::string version){
-    // ModSecurity wants the HTTP/ removed from the 1.1
-    version = version.substr(5,version.length()-5);
-    ModSecurity::msc_process_uri(_pmodsecAssay,uri.c_str(),method.c_str(),version.c_str());
-    return 1;
-}
-
-int ModSecurityAnalyzer::RunPhases(){
-    ModSecurity::msc_process_request_headers(_pmodsecAssay);
-    ModSecurity::msc_process_request_body(_pmodsecAssay);
-    ModSecurity::msc_process_response_headers(_pmodsecAssay);
-    ModSecurity::msc_process_response_body(_pmodsecAssay);
-    ModSecurity::msc_process_logging(_pmodsecAssay, 200);
-    return 1;
-}
-
-int ModSecurityAnalyzer::RunCleanup(){
-    ModSecurity::msc_rules_cleanup(_rules);
-    ModSecurity::msc_cleanup(_modsec);
-}
-
- 
 
 class Packet
 {
@@ -91,7 +31,10 @@ class Packet
         Packet(pcap_pkthdr *header, const u_char *data, int verbose);
         int parsePacket();
         int setTCPIPdata();
-        int extractHTTP(std::string type);
+        int extractHTTPuri(std::string type);
+        int extractHTTPRequest();
+        int extractHTTPResponse();
+        int request;
         std::string src;
         std::string dst;
         int srcprt;
@@ -101,6 +44,11 @@ class Packet
         std::string uri;
         std::string version;
         bool httpDetected = false;
+        std::vector<std::string> headerNames;
+        std::vector<std::string> headerValues;    
+        std::string bodyData = "";
+
+ std::vector<std::string> _splitHTTP;
         
     private:
         int _verbose;
@@ -111,6 +59,7 @@ class Packet
         struct ip6_hdr *_ip6;
         struct tcphdr *_tcp;
         std::string _appData;
+        int _hasHTTPData = 0;
 };
 
 // Our constructor that collects the packet header and data
@@ -167,7 +116,6 @@ int Packet::parsePacket()
         _appData = (char*)(_data + sizeof(struct ether_header) + sizeof(struct ip) + sizeof(struct tcphdr));
         // Check if we have any data
         if(_appData.length() != 0){
-            //std::cout << "TEST" << std::endl;
             hasData = 1;
             if(_verbose){
                 std::cout << "[+] Remaining data is " << _appData.length() << " bytes long" << std::endl;
@@ -218,8 +166,14 @@ int Packet::setTCPIPdata()
     }
 }
 
-int Packet::extractHTTP(std::string type)   
+int Packet::extractHTTPuri(std::string type)   
 {
+    // Store our type for later
+    if(type == "Request"){    
+        request = 1;
+    }else{
+        request = 0;
+    }
     std::vector<std::string> seglist;
     int start = 0;
     // Add each line of a potentail request to a vector (split on \r\n)
@@ -236,8 +190,9 @@ int Packet::extractHTTP(std::string type)
     if( start != _appData.length()-start){
         seglist.push_back(_appData.substr(start,_appData.length()-start));
     }
+    _splitHTTP = seglist;
     std::string firstLine = seglist.front();
-    if(type == "Request"){
+    if(request){
         
         int firstSpace = -1;
         int secondSpace = -1;
@@ -287,7 +242,157 @@ int Packet::extractHTTP(std::string type)
     }
 }
 
-             
+
+int Packet::extractHTTPRequest()   
+{
+    if(!request){
+        std::cout << "HELLO" << std::endl;
+    }
+    // We have a requestURI and something else (maybe headers)
+    if(_splitHTTP.size() > 1){
+        // First line is requestURI - last line may be data
+        for(std::vector<std::string>::size_type header = 1; header != _splitHTTP.size()-1; header++) {
+            // Ignore blank lines
+            if(_splitHTTP[header] == ""){
+                continue;
+            }
+            // Search for colon
+            for(int i = 0;i<_splitHTTP[header].length();i++){
+                if(_splitHTTP[header].at(i) == ':'){
+                    headerNames.push_back(_splitHTTP[header].substr(0,i));
+                    headerValues.push_back(_splitHTTP[header].substr(i+1,_splitHTTP[header].length()-(i+1)));
+                    break;
+                }
+            }
+        }
+        // Check our headers to see if there is content
+        for(auto headerName: headerNames){
+            if(headerName == "Content-Length"){
+                _hasHTTPData = 1;
+            }
+        }
+        // Also check for a black CRLF as the penultimate item
+        if (_splitHTTP.rbegin()[1] == ""){
+            _hasHTTPData = 1;
+        }
+        // if there is data extract it as data, otherwise its a header
+        if(_hasHTTPData){
+            bodyData = _splitHTTP.back();
+        }else{
+            for(int i = 0;i<_splitHTTP.back().length();i++){
+                if(_splitHTTP.back().at(i) == ':'){
+                    headerNames.push_back(_splitHTTP.back().substr(0,i));
+                    headerValues.push_back(_splitHTTP.back().substr(i+1,_splitHTTP.back().length()-(i+1)));
+                }
+            }
+        }
+   
+    }
+}
+
+int Packet::extractHTTPResponse()   
+{
+}  
+         
+
+class ModSecurityAnalyzer
+{
+    public:
+        ModSecurityAnalyzer(std::string main_rule_uri);
+        int AddConnectionInfo(std::string src,int srcprt,std::string dst,int dstprt);
+        int AddRequestInfo(Packet *mypacket);
+        int AddResponseInfo();
+        int RunPhases();
+        int RunCleanup();
+    private:
+        // ModSecurity engine 
+        modsecurity::ModSecurity *_modsec;
+      
+       // modsecurity rules
+       modsecurity::Rules *_rules;
+ 
+       // modsecurity transaction object
+       modsecurity::Assay *_pmodsecAssay;
+};
+
+ModSecurityAnalyzer::ModSecurityAnalyzer(std::string main_rule_uri){
+    const char *error = NULL;
+    // Connect to libmodsecurity
+    _modsec = modsecurity::msc_init();
+    modsecurity::msc_set_connector_info(_modsec, "ModSecurity-pcap v0.0.1-alpha");
+    // Load the modsecurity rules specified.
+    _rules = modsecurity::msc_create_rules_set();
+    if(msc_rules_add_file(_rules, main_rule_uri.c_str(), &error) < 0){
+        std::cerr << "Error: Issues loading the rules." << std::endl << error << std::endl;
+    }
+    modsecurity::msc_rules_dump(_rules);
+}
+
+
+int ModSecurityAnalyzer::AddConnectionInfo(std::string src,int srcprt,std::string dst,int dstprt){
+    _pmodsecAssay = modsecurity::msc_new_assay(_modsec, _rules, NULL);
+    _pmodsecAssay->processConnection(src.c_str(), srcprt, dst.c_str(), dstprt);
+    return 1;       
+
+}
+
+int ModSecurityAnalyzer::AddRequestInfo(Packet *mypacket){
+    std::string uri = mypacket->uri;
+    std::string method = mypacket->method;
+    std::string version = mypacket->version;
+    std::vector<std::string> headerNames = mypacket->headerNames;
+    std::vector<std::string> headerValues =mypacket->headerValues;
+    std::string bodyData = mypacket->bodyData;
+
+    // ModSecurity wants the HTTP/ removed from the 1.1
+    version = version.substr(5,version.length()-5);
+    _pmodsecAssay->processURI(uri.c_str(),method.c_str(),version.c_str());
+    for(std::vector<std::string>::size_type header = 0; header != headerNames.size(); header++) {
+      _pmodsecAssay->addRequestHeader(reinterpret_cast<const unsigned char*>(headerNames[header].c_str()),reinterpret_cast<const unsigned char*>(headerValues[header].c_str()));
+    }
+    // Add the body data only if it has a body
+    if(bodyData != "" ){
+        _pmodsecAssay->appendRequestBody(reinterpret_cast<const unsigned char*>(bodyData.c_str()),bodyData.length());
+    }
+    return 1;
+}
+
+int ModSecurityAnalyzer::AddResponseInfo(){
+    modsecurity::ModSecurityIntervention status_it;
+    //modsecurity::msc_append_response_body(_pmodsecAssay,(const unsigned char*)"",0);
+    
+    //analysis attack by modesecurity engine
+    _pmodsecAssay->processResponseBody();
+    _pmodsecAssay->intervention(&status_it);
+    if( status_it.disruptive == 1)
+    {
+        if(status_it.log != NULL){
+             std::cerr << "processResponseBody intervention: " << status_it.log << std::endl;
+        }else{
+             std::cerr << "no data received from modsecuritylib in processResponseBody: status_it.log is NULL" << std::endl;
+
+        }
+        return true;
+    }
+}
+
+
+int ModSecurityAnalyzer::RunPhases(){
+    _pmodsecAssay->processRequestHeaders();
+    _pmodsecAssay->processRequestBody();
+    _pmodsecAssay->processResponseHeaders();
+    _pmodsecAssay->processResponseBody();
+    _pmodsecAssay->processLogging(200);
+    return 1;
+}
+
+int ModSecurityAnalyzer::RunCleanup(){
+    modsecurity::msc_rules_cleanup(_rules);
+    modsecurity::msc_cleanup(_modsec);
+}
+
+ 
+  
 // Returns -1 on error
 // Returns 1 on success
 int checkArgs(int argc, char** argv, int* verboseRef, std::string* filenameRef)
@@ -390,10 +495,11 @@ int main(int argc, char* argv[])
             // Check if it is on a common HTTP port first
             if((mypacket->srcprt == 80 || mypacket->srcprt == 8080) && mypacket->hasData == 1){
                 // Extract HTTP information
-                mypacket->extractHTTP("Response");
+                mypacket->extractHTTPuri("Response");
             }
             if((mypacket->dstprt == 80 || mypacket->dstprt== 8080) && mypacket->hasData == 1 ){
-                mypacket->extractHTTP("Request");
+                mypacket->extractHTTPuri("Request");
+                
             }     
         }else{
             if(verbose){
@@ -402,8 +508,13 @@ int main(int argc, char* argv[])
             }
         }
         if(mypacket->httpDetected == true){
+            if(mypacket->request){
+                mypacket->extractHTTPRequest();
+            }
             msa->AddConnectionInfo(mypacket->src, mypacket->srcprt,mypacket->dst,mypacket->dstprt);
-            msa->AddRequestInfo(mypacket->uri,mypacket->method,mypacket->version);
+            if(mypacket->request){
+                msa->AddRequestInfo(mypacket);
+            }
             msa->RunPhases();
         }
     }
